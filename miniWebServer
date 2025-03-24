@@ -1,0 +1,312 @@
+.intel_syntax noprefix
+.globl _start
+
+.section .data
+    bind_address: .long 0x00000000          # 0.0.0.0 in hexadecimal (network byte order)
+    bind_port: .word 0x5000                 # Port 80 in hexadecimal (network byte order)
+    response_header: .asciz "HTTP/1.0 200 OK\r\n\r\n"
+    not_found_header: .asciz "HTTP/1.0 404 Not Found\r\n\r\n"
+    create_error_header: .asciz "HTTP/1.0 500 Internal Server Error\r\n\r\n"
+    method_get: .asciz "GET "
+    method_post: .asciz "POST "
+
+.section .bss
+    .lcomm buffer, 4096                     # Buffer for reading requests
+    .lcomm file_buffer, 4096                # Buffer for reading file contents
+    .lcomm file_path, 256                   # Buffer for storing file path
+    .lcomm content_length_buffer, 16        # Buffer for Content-Length value
+    .lcomm write_buffer, 4096               # Buffer for writing data to file
+
+.section .text
+
+_start:
+    # Step 1: Create socket
+    mov rdi, 2              # AF_INET (IPv4)
+    mov rsi, 1              # SOCK_STREAM (TCP)
+    mov rdx, 0              # IPPROTO_IP (IP protocol)
+    mov rax, 41             # syscall number for socket (SYS_socket)
+    syscall
+
+    # Save the socket file descriptor
+    mov r12, rax
+
+    # Step 2: Prepare sockaddr_in structure
+    sub rsp, 16
+    mov rdi, rsp
+    mov word ptr [rdi], 2                   # sa_family=AF_INET
+    mov word ptr [rdi+2], 0x5000            # sin_port=htons(80)
+    mov dword ptr [rdi+4], 0                # sin_addr=inet_addr("0.0.0.0")
+    mov qword ptr [rdi+8], 0                # zero the rest of the structure
+
+    # Step 3: Bind socket
+    mov rdi, r12                           # socket file descriptor
+    mov rsi, rsp                           # pointer to sockaddr_in
+    mov rdx, 16                            # length of sockaddr_in
+    mov rax, 49                            # syscall number for bind (SYS_bind)
+    syscall
+
+    # Step 4: Listen on socket
+    mov rdi, r12                           # socket file descriptor
+    mov rsi, 128                           # backlog
+    mov rax, 50                            # syscall number for listen (SYS_listen)
+    syscall
+
+.loop:
+    # Step 5: Accept connection
+    mov rdi, r12                           # socket file descriptor
+    mov rsi, 0                             # NULL (pointer for sockaddr)
+    mov rdx, 0                             # NULL (pointer for socklen_t)
+    mov rax, 43                            # syscall number for accept (SYS_accept)
+    syscall
+
+    # Save accepted socket file descriptor
+    mov r13, rax
+
+    # Step 6: Create child process
+    mov rax, 57                            # syscall number for fork (SYS_fork)
+    syscall
+
+    # Parent process
+    cmp rax, 0
+    jg parent_process
+
+    # Child process
+    cmp rax, 0
+    je child_process
+
+parent_process:
+    # Parent closes accepted socket and continues listening
+    mov rdi, r13                           # accepted socket file descriptor
+    mov rax, 3                             # syscall number for close (SYS_close)
+    syscall
+    jmp .loop                              # Continue accepting next request
+
+child_process:
+    # Child closes listening socket
+    mov rdi, r12                           # listening socket file descriptor
+    mov rax, 3                             # syscall number for close (SYS_close)
+    syscall
+
+    # Step 7: Read HTTP request
+    mov rdi, r13                           # accepted socket file descriptor
+    lea rsi, [buffer]                      # buffer to read into
+    mov rdx, 4096                          # maximum number of bytes to read
+    mov rax, 0                             # syscall number for read (SYS_read)
+    syscall
+    test rax, rax
+    js error_response                      # Handle read error
+
+    # Step 8: Check request type (GET or POST)
+    lea rdi, [buffer]                      # Go to the start of the request
+    lea rsi, [method_get]
+    mov rcx, 4                             # Length of "GET "
+    repe cmpsb
+    je handle_get                          # If matches, handle GET request
+
+    lea rdi, [buffer]
+    lea rsi, [method_post]
+    mov rcx, 5                             # Length of "POST "
+    repe cmpsb
+    je handle_post                         # If matches, handle POST request
+
+    jmp error_response                     # Unknown request type
+
+handle_get:
+    # Extract file path from request
+    lea rdi, [buffer + 4]                  # Skip "GET "
+    lea rsi, [file_path]                   # Target file path buffer
+    mov byte ptr [rsi], '/'                # Ensure file path starts with root directory
+    inc rsi                                # Skip the first slash
+    mov rcx, 254                           # Maximum 254 bytes to read
+extract_get_path:
+    cmp byte ptr [rdi], ' '                # Check for space character
+    je  open_get_file                      # If space, end file path extraction
+    mov al, byte ptr [rdi]                 # Read one character from the request
+    mov byte ptr [rsi], al                 # Write to file path buffer
+    inc rdi
+    inc rsi
+    loop extract_get_path
+
+open_get_file:
+    mov byte ptr [rsi], 0                  # Add null terminator at the end of file path
+
+    # Open file and send response
+    call open_and_send_file
+    jmp close_connection
+
+handle_post:
+    # Extract file path from request
+    lea rdi, [buffer + 5]                  # Skip "POST /"
+    lea rsi, [file_path]
+    mov byte ptr [rsi], '/'
+    inc rsi
+    mov rcx, 254
+extract_post_path:
+    cmp byte ptr [rdi], ' '
+    je  open_post_file
+    mov al, byte ptr [rdi]
+    mov byte ptr [rsi], al
+    inc rdi
+    inc rsi
+    loop extract_post_path
+
+open_post_file:
+    mov byte ptr [rsi], 0
+
+    # Open file for writing data
+    lea rdi, [file_path]
+    mov rsi, 65                           # O_WRONLY | O_CREAT 
+    mov rdx, 0777                         # Permissions 0777
+    mov rax, 2                             # syscall number for open (SYS_open)
+    syscall
+    test rax, rax
+    js error_response                      # Handle file open error
+    mov r15, rax                           # Save file descriptor
+
+    # Find request body data and write to file
+    call find_and_write_body
+    jmp close_connection
+
+open_and_send_file:
+    # Try to open file
+    lea rdi, [file_path]
+    mov rsi, 0                             # O_RDONLY
+    mov rax, 2                             # syscall number for open (SYS_open)
+    syscall
+    test rax, rax
+    js not_found                           # If file open fails, return 404 response
+
+    mov r14, rax                           # Save file descriptor
+
+    # Read file content
+    mov rdi, r14                           # file descriptor
+    lea rsi, [file_buffer]                 # buffer to read file into
+    mov rdx, 4096                          # maximum number of bytes to read
+    mov rax, 0                             # syscall number for read (SYS_read)
+    syscall
+    test rax, rax
+    js error_response                      # Handle file read error
+
+    mov r15, rax                           # Save number of bytes read
+
+    # Close file
+    mov rdi, r14
+    mov rax, 3                             # syscall number for close (SYS_close)
+    syscall
+
+    # Write HTTP response header
+    mov rdi, r13                           # accepted socket file descriptor
+    lea rsi, [response_header]             # pointer to response header
+    mov rdx, 19                            # length of the response header
+    mov rax, 1                             # syscall number for write (SYS_write)
+    syscall
+
+    # Write file content
+    mov rdi, r13                           # accepted socket file descriptor
+    lea rsi, [file_buffer]                 # buffer with file content
+    mov rdx, r15                           # length of the file content
+    mov rax, 1                             # syscall number for write (SYS_write)
+    syscall
+
+    jmp close_connection                   # Jump to close connection section
+
+find_and_write_body:
+    lea rdi, [buffer]                      # Go to start of the request
+    xor rcx, rcx                           # Clear newline counter
+    mov rbx, 8                             # Target number of newlines
+find_next_newline:
+    mov al, byte ptr [rdi]                 # Read current byte
+    cmp al, 10                             # Check if it is '\n' (ASCII 10)
+    je count_newline
+    inc rdi                                # Move to next byte
+    jmp find_next_newline
+
+count_newline:
+    inc rcx                                # Increment newline counter
+    inc rdi                                # Move to next byte
+    cmp rcx, rbx                           # Check if 8 newlines found
+    jl find_next_newline                   # If less than 8, continue searching
+
+    # After finding 8 newlines, rdi points to the start of the body data
+    mov rsi, rdi                           # rsi points to the start of body data
+    lea rdi, [write_buffer]                # Data write buffer
+    mov rcx, 4096                          # Max length to read data
+    rep movsb                              # Copy data to write buffer
+    sub rcx, 4096                          # Get actual copied bytes (4096 - remaining rcx)
+
+    # Calculate actual data length (until the first null terminator \0)
+    lea rsi, [write_buffer]
+    mov rdi, rsi                           # Reset pointer to write buffer start
+    xor rcx, rcx                           # Clear counter
+count_data_length:
+    cmp byte ptr [rdi], 0                  # Check for null terminator \0
+    je write_to_file                       # If found, end
+    inc rdi                                # Move to next byte
+    inc rcx                                # Increment data length counter
+    jmp count_data_length
+
+write_to_file:
+    # Write to file
+    mov rdi, r15                           # File descriptor
+    lea rsi, [write_buffer]                # Write buffer
+    mov rdx, rcx                           # Actual bytes to write
+    mov rax, 1                             # syscall number for write (SYS_write)
+    syscall
+    test rax, rax                          # Check if write was successful
+    js write_error                         # If failed, jump to error handling
+
+    # Close file
+    mov rdi, r15
+    mov rax, 3                             # syscall number for close (SYS_close)
+    syscall
+    test rax, rax                          # Check if close was successful
+    js write_error
+
+    # Send success response
+    mov rdi, r13
+    lea rsi, [response_header]
+    mov rdx, 19
+    mov rax, 1                             # syscall number for write (SYS_write)
+    syscall
+    test rax, rax                          # Check if write was successful
+    js write_error
+
+    jmp close_connection
+
+write_error:
+    # Send 500 Internal Server Error response
+    mov rdi, r13
+    lea rsi, [create_error_header]
+    mov rdx, 36
+    mov rax, 1                             # syscall number for write (SYS_write)
+    syscall
+    jmp close_connection
+
+not_found:
+    # Write 404 response
+    mov rdi, r13                           # accepted socket file descriptor
+    lea rsi, [not_found_header]            # pointer to 404 response header
+    mov rdx, 24                            # length of the 404 response header
+    mov rax, 1                             # syscall number for write (SYS_write)
+    syscall
+    jmp close_connection
+
+error_response:
+    # Send error response
+    mov rdi, r13
+    lea rsi, [create_error_header]
+    mov rdx, 36
+    mov rax, 1
+    syscall
+    jmp close_connection
+
+close_connection:
+    # Close accepted socket
+    mov rdi, r13
+    mov rax, 3                             # syscall number for close (SYS_close)
+    syscall
+
+    # Exit child process
+    mov rdi, 0                             # Exit code 0
+    mov rax, 60                            # syscall number for exit (SYS_exit)
+    syscall
